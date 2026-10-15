@@ -4,7 +4,9 @@ X Server / X Stream — single-file bootstrap application
 Target: Android Termux / Python + Flask + SQLite
 
 Install:
-    python -m pip install flask werkzeug requests
+    python -m pip install -r requirements.txt
+Optional TMDB metadata:
+    python -m pip install requests
 Run:
     python x_server.py
 
@@ -27,26 +29,30 @@ import sqlite3
 import secrets
 import mimetypes
 import subprocess
+import logging
+import threading
 from pathlib import Path
 from functools import wraps
-from datetime import datetime, timedelta
-from urllib.parse import quote
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 from flask import (
     Flask, request, redirect, url_for, session, abort, jsonify,
-    render_template_string, Response, flash, send_file
+    render_template_string, Response, flash
 )
 from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.utils import secure_filename
 
 APP_NAME = "X Server"
 MEDIA_NAME = "X Stream"
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-LOG_DIR = BASE_DIR / "logs"
+DATA_DIR = Path(os.environ.get("XSERVER_DATA_DIR", str(BASE_DIR / "data"))).expanduser()
+LOG_DIR = Path(os.environ.get("XSERVER_LOG_DIR", str(BASE_DIR / "logs"))).expanduser()
 DB_PATH = DATA_DIR / "xserver.sqlite3"
 DEFAULT_MOVIE_DIR = Path("/storage/emulated/0/Movies")
-MOVIE_DIR = Path(os.environ.get("XSERVER_MOVIE_DIR", str(DEFAULT_MOVIE_DIR))).expanduser()
+MOVIE_DIR_FROM_ENV = os.environ.get("XSERVER_MOVIE_DIR")
+MOVIE_DIR = Path(MOVIE_DIR_FROM_ENV or str(DEFAULT_MOVIE_DIR)).expanduser()
 MC_DIR = Path(os.environ.get("XSERVER_MC_DIR", str(Path.home() / "mc_server"))).expanduser()
+MC_JAR_FROM_ENV = os.environ.get("XSERVER_MC_JAR", "").strip()
+MC_MAX_MEMORY_MB_SETTING = os.environ.get("XSERVER_MC_MAX_MEMORY_MB", "512")
 HOST = os.environ.get("XSERVER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("XSERVER_PORT", "5000"))
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip()
@@ -55,21 +61,20 @@ MAX_LOGIN_ATTEMPTS = 8
 LOGIN_WINDOW_SECONDS = 300
 SESSION_HOURS = 12
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 app = Flask(__name__)
 # Persist a random secret so sessions remain valid across normal restarts.
 SECRET_PATH = DATA_DIR / "session_secret"
 if SECRET_PATH.exists():
     SECRET_KEY = SECRET_PATH.read_text(encoding="utf-8").strip()
+    if not SECRET_KEY:
+        raise RuntimeError(f"Session secret file is empty: {SECRET_PATH}")
 else:
     SECRET_KEY = secrets.token_hex(32)
     SECRET_PATH.write_text(SECRET_KEY, encoding="utf-8")
-    try:
-        SECRET_PATH.chmod(0o600)
-    except OSError:
-        pass
+SECRET_PATH.chmod(0o600)
 app.secret_key = SECRET_KEY
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -78,6 +83,8 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(hours=SESSION_HOURS),
     MAX_CONTENT_LENGTH=2 * 1024 * 1024,
 )
+app.logger.setLevel(logging.INFO)
+MC_START_LOCK = threading.Lock()
 
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -87,6 +94,7 @@ def db():
     return conn
 
 def init_db():
+    database_existed = DB_PATH.exists()
     with db() as con:
         con.executescript("""
         CREATE TABLE IF NOT EXISTS users (
@@ -126,7 +134,18 @@ def init_db():
             count INTEGER NOT NULL DEFAULT 0,
             window_start REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """)
+        if MOVIE_DIR_FROM_ENV is None:
+            row = con.execute("SELECT value FROM settings WHERE key='movie_dir'").fetchone()
+            if row:
+                global MOVIE_DIR
+                MOVIE_DIR = Path(row["value"]).expanduser()
+    if not database_existed:
+        DB_PATH.chmod(0o600)
 init_db()
 
 def has_user():
@@ -158,9 +177,42 @@ def login_required(fn):
     def wrapped(*args, **kwargs):
         if not session.get("user_id"):
             return redirect(url_for("login", next=request.path))
+        with db() as con:
+            row = con.execute("SELECT value FROM settings WHERE key='session_version'").fetchone()
+        current_version = int(row["value"]) if row else 0
+        session_version = session.get("session_version")
+        if session_version is None and current_version == 0:
+            session["session_version"] = 0
+        elif session_version != current_version:
+            session.clear()
+            return redirect(url_for("login", next=request.path))
         session.permanent = True
         return fn(*args, **kwargs)
     return wrapped
+
+def safe_next_target(target):
+    if not target or not target.startswith("/") or target.startswith("//") or "\\" in target:
+        return url_for("dashboard")
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc or any(ord(char) < 32 for char in target):
+        return url_for("dashboard")
+    return target
+
+@app.after_request
+def set_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' https://image.tmdb.org data:; "
+        "media-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'",
+    )
+    if app.config["SESSION_COOKIE_SECURE"]:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return response
 
 def login_throttled(ip):
     now = time.time()
@@ -211,6 +263,21 @@ def scan_movies():
     except (OSError, PermissionError) as exc:
         return [], f"Cannot access movie folder: {exc}"
 
+def application_health(movie_count=None):
+    database_ok = False
+    try:
+        with db() as con:
+            result = con.execute("PRAGMA quick_check").fetchone()
+            database_ok = bool(result and result[0] == "ok")
+    except sqlite3.Error as exc:
+        app.logger.error("Database health check failed: %s", type(exc).__name__)
+    return {
+        "database_ok": database_ok,
+        "database_path": str(DB_PATH),
+        "movie_count": movie_count,
+        "movie_directory_accessible": MOVIE_DIR.is_dir() and os.access(MOVIE_DIR, os.R_OK),
+    }
+
 def safe_movie_by_key(key):
     if not re.fullmatch(r"[a-f0-9]{32}", key or ""):
         return None
@@ -243,6 +310,10 @@ def tmdb_lookup(item):
         return metadata_for(item)
     try:
         import requests
+    except ImportError:
+        app.logger.warning("Optional metadata lookup is enabled but requests is not installed")
+        return metadata_for(item)
+    try:
         title = re.sub(r"[\._]+", " ", item["title"]).strip()
         response = requests.get(
             "https://api.themoviedb.org/3/search/movie",
@@ -250,8 +321,9 @@ def tmdb_lookup(item):
             timeout=5,
         )
         response.raise_for_status()
-        results = response.json().get("results", [])
-        if not results:
+        payload = response.json()
+        results = payload.get("results", []) if isinstance(payload, dict) else []
+        if not isinstance(results, list) or not results or not isinstance(results[0], dict):
             return metadata_for(item)
         match = results[0]
         data = {
@@ -262,7 +334,7 @@ def tmdb_lookup(item):
             "backdrop_path": match.get("backdrop_path") or "",
             "genres": "",
             "year": (match.get("release_date") or "")[:4],
-            "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         with db() as con:
             con.execute("""INSERT OR REPLACE INTO metadata
@@ -271,7 +343,8 @@ def tmdb_lookup(item):
                 (data["movie_key"], data["title"], data["overview"], data["poster_path"],
                  data["backdrop_path"], data["genres"], data["year"], data["updated_at"]))
         return data
-    except Exception:
+    except (requests.RequestException, ValueError, sqlite3.Error) as exc:
+        app.logger.warning("Optional metadata lookup failed: %s", type(exc).__name__)
         return metadata_for(item)
 
 def poster_url(meta, backdrop=False):
@@ -304,7 +377,7 @@ BASE_HTML = r"""
 </head><body>
 <header class="topbar">
 <a class="brand" href="{{ url_for('dashboard') if logged_in else url_for('login') }}"><b>X</b> SERVER</a>
-{% if logged_in %}<nav><a href="{{ url_for('dashboard') }}">Home</a><a href="{{ url_for('movies_page') }}">X Stream</a><a class="optional" href="{{ url_for('my_list_page') }}">My List</a><a class="optional" href="{{ url_for('minecraft_page') }}">Minecraft</a><a class="optional" href="{{ url_for('settings_page') }}">Settings</a><a href="{{ url_for('logout') }}">Logout</a></nav>{% endif %}
+{% if logged_in %}<nav><a href="{{ url_for('dashboard') }}">Home</a><a href="{{ url_for('movies_page') }}">X Stream</a><a class="optional" href="{{ url_for('my_list_page') }}">My List</a><a class="optional" href="{{ url_for('minecraft_page') }}">Minecraft</a><a class="optional" href="{{ url_for('diagnostics_page') }}">Diagnostics</a><a class="optional" href="{{ url_for('settings_page') }}">Settings</a><a class="optional" href="{{ url_for('change_password') }}">Password</a><form class="inline" method="post" action="{{ url_for('logout') }}"><input type="hidden" name="_csrf" value="{{ csrf() }}"><button class="secondary" type="submit">Logout</button></form></nav>{% endif %}
 </header>
 <main class="wrap">
 {% with messages = get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="notice {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
@@ -358,6 +431,8 @@ def setup():
             flash("User ID must be 3–64 characters: letters, numbers, dot, underscore, @ or hyphen.", "error")
         elif len(password) < 10:
             flash("Use a password with at least 10 characters.", "error")
+        elif len(password) > 256:
+            flash("Password cannot exceed 256 characters.", "error")
         elif password != confirm:
             flash("Passwords do not match.", "error")
         else:
@@ -365,7 +440,7 @@ def setup():
                 with db() as con:
                     # INSERT OR IGNORE ensures setup can never overwrite an existing account.
                     con.execute("INSERT OR IGNORE INTO users(id,username,password_hash,created_at) VALUES(1,?,?,?)",
-                                (username, generate_password_hash(password), datetime.utcnow().isoformat(timespec="seconds")))
+                                (username, generate_password_hash(password), datetime.now(timezone.utc).isoformat(timespec="seconds")))
                 if has_user():
                     flash("Private account created. Sign in with the same User ID and password.", "success")
                     return redirect(url_for("login"))
@@ -389,6 +464,12 @@ def login():
         else:
             username = request.form.get("username", "").strip()
             password = request.form.get("password", "")
+            if len(password) > 256:
+                record_login_failure(ip)
+                flash("Incorrect User ID or password.", "error")
+                return page("Sign in", AUTH_FORM, heading="Welcome back",
+                            subtitle="Sign in to your private X Server.", setup=False,
+                            username=username)
             with db() as con:
                 user = con.execute("SELECT * FROM users WHERE id=1 AND username=?", (username,)).fetchone()
             if user and check_password_hash(user["password_hash"], password):
@@ -396,19 +477,68 @@ def login():
                 session.clear()
                 session["user_id"] = user["id"]
                 session["username"] = user["username"]
+                with db() as con:
+                    row = con.execute("SELECT value FROM settings WHERE key='session_version'").fetchone()
+                session["session_version"] = int(row["value"]) if row else 0
                 session.permanent = True
                 csrf_token()
-                return redirect(request.args.get("next") if request.args.get("next", "").startswith("/") and not request.args.get("next", "").startswith("//") else url_for("dashboard"))
+                return redirect(safe_next_target(request.args.get("next", "")))
             record_login_failure(ip)
             flash("Incorrect User ID or password.", "error")
     return page("Sign in", AUTH_FORM, heading="Welcome back",
                 subtitle="Sign in to your private X Server.", setup=False,
                 username=request.form.get("username", ""))
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
+@login_required
 def logout():
+    verify_csrf()
     session.clear()
     return redirect(url_for("login"))
+
+@app.route("/account/password", methods=["GET", "POST"])
+@login_required
+def change_password():
+    if request.method == "POST":
+        verify_csrf()
+        current_password = request.form.get("current_password", "")
+        new_password = request.form.get("new_password", "")
+        confirm = request.form.get("confirm", "")
+        with db() as con:
+            user = con.execute(
+                "SELECT password_hash FROM users WHERE id=?",
+                (session.get("user_id"),),
+            ).fetchone()
+            if not user or not check_password_hash(user["password_hash"], current_password):
+                flash("Current password is incorrect.", "error")
+            elif len(new_password) < 10 or len(new_password) > 256:
+                flash("Use a new password between 10 and 256 characters.", "error")
+            elif new_password != confirm:
+                flash("New passwords do not match.", "error")
+            else:
+                con.execute(
+                    "UPDATE users SET password_hash=? WHERE id=?",
+                    (generate_password_hash(new_password), session["user_id"]),
+                )
+                row = con.execute("SELECT value FROM settings WHERE key='session_version'").fetchone()
+                version = int(row["value"]) + 1 if row else 1
+                con.execute(
+                    "INSERT INTO settings(key,value) VALUES('session_version',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(version),),
+                )
+                session.clear()
+                flash("Password changed. Sign in again with your new password.", "success")
+                return redirect(url_for("login"))
+    body = r"""
+    <div class="narrow card"><div class="eyebrow">Account security</div><h1>Change password</h1>
+    <form method="post"><input type="hidden" name="_csrf" value="{{csrf()}}">
+    <label for="current_password">Current password</label><input id="current_password" name="current_password" type="password" autocomplete="current-password" required>
+    <label for="new_password">New password</label><input id="new_password" name="new_password" type="password" autocomplete="new-password" minlength="10" maxlength="256" required>
+    <label for="confirm">Confirm new password</label><input id="confirm" name="confirm" type="password" autocomplete="new-password" minlength="10" maxlength="256" required>
+    <div class="form-actions"><button type="submit">Update password</button></div></form></div>
+    """
+    return page("Change password", body)
 
 @app.route("/dashboard")
 @login_required
@@ -429,6 +559,8 @@ def dashboard():
     featured = (recent[0] if recent else None)
     featured_meta = tmdb_lookup(featured) if featured else {}
     movie_count = len(movies)
+    health = application_health(movie_count)
+    minecraft = minecraft_status()
     body = r"""
     {% if featured %}
     <section class="hero" style="--hero-bg:url('{{ poster_url(featured_meta, true) or poster_url(featured_meta) }}')">
@@ -441,15 +573,16 @@ def dashboard():
     <section class="hero"><div class="hero-copy"><div class="eyebrow">X Stream</div><h1>Your cinema.<br>Your rules.</h1><p>Build your personal library by placing videos in your Movies folder. X Stream will discover supported files automatically.</p><div class="actions"><a class="btn" href="{{ url_for('movies_page') }}">Open X Stream</a></div></div></section>
     {% endif %}
     {% if scan_error %}<div class="notice error">{{ scan_error }}. In Termux, run <code>termux-setup-storage</code> and allow storage access, then check the folder path.</div>{% endif %}
-    <section class="section"><div class="stats"><div class="stat"><strong>{{ movie_count }}</strong><span class="muted">Local movies</span></div><div class="stat"><strong>{{ resume|length }}</strong><span class="muted">Continue watching</span></div><div class="stat"><strong>{{ 'Online artwork enabled' if tmdb_enabled else 'Local-first mode' }}</strong><span class="muted">Metadata status</span></div></div></section>
+    <section class="section"><div class="stats"><div class="stat"><strong>{{ movie_count }}</strong><span class="muted">Local movies</span></div><div class="stat"><strong>{{ resume|length }}</strong><span class="muted">Continue watching</span></div><div class="stat"><strong>{{ 'Healthy' if health.database_ok else 'Check failed' }}</strong><span class="muted">Application database</span></div><div class="stat"><strong>{{ 'Running' if minecraft.running else 'Stopped' }}</strong><span class="muted">Managed Minecraft process</span></div></div></section>
     {% if resume %}<section class="section"><div class="section-head"><h2>Continue Watching</h2><a class="muted" href="{{ url_for('movies_page') }}">View library →</a></div><div class="grid">{% for m in resume %}<a class="movie" href="{{ url_for('movie_detail',key=m.key) }}"><div class="poster">{% set p=poster_url(m.meta) %}{% if p %}<img loading="lazy" src="{{ p }}" alt="Artwork for {{ m.title }}">{% else %}<div class="poster-fallback">{{ m.title }}</div>{% endif %}</div><div class="movie-title">{{ m.title }}</div><div class="movie-sub">Resume · {{ m.percent }}%</div><div class="progress"><span style="width:{{m.percent}}%"></span></div></a>{% endfor %}</div></section>{% endif %}
     <section class="section"><div class="section-head"><h2>Recently Added</h2><a class="muted" href="{{ url_for('movies_page') }}">See all →</a></div>
     {% if recent %}<div class="grid">{% for m in recent[:5] %}<a class="movie" href="{{ url_for('movie_detail',key=m.key) }}"><div class="poster">{% set meta=metadata_for(m) %}{% set p=poster_url(meta) %}{% if p %}<img loading="lazy" src="{{ p }}" alt="Artwork for {{m.title}}">{% else %}<div class="poster-fallback">{{m.title}}</div>{% endif %}</div><div class="movie-title">{{m.title}}</div><div class="movie-sub">{{m.extension }} · {{fmt_size(m.size)}}</div></a>{% endfor %}</div>{% else %}<div class="empty">No movies found yet.<br><span class="small">Expected folder: {{ movie_dir }}</span></div>{% endif %}</section>
-    <section class="section"><div class="section-head"><h2>Services</h2></div><div class="actions"><a class="btn secondary" href="{{ url_for('minecraft_page') }}">Minecraft Manager</a><a class="btn secondary" href="{{ url_for('settings_page') }}">Settings</a></div></section>
+    <section class="section"><div class="section-head"><h2>Services</h2></div><div class="actions"><a class="btn secondary" href="{{ url_for('minecraft_page') }}">Minecraft Manager</a><a class="btn secondary" href="{{ url_for('diagnostics_page') }}">Read-only Diagnostics</a><a class="btn secondary" href="{{ url_for('settings_page') }}">Settings</a></div></section>
     """
     return page("Dashboard", body, featured=featured, featured_meta=featured_meta, movie_count=movie_count,
                 recent=recent, resume=resume, scan_error=scan_error, movie_dir=str(MOVIE_DIR),
-                poster_url=poster_url, metadata_for=metadata_for, fmt_size=fmt_size, tmdb_enabled=bool(TMDB_API_KEY))
+                poster_url=poster_url, metadata_for=metadata_for, fmt_size=fmt_size, tmdb_enabled=bool(TMDB_API_KEY),
+                health=health, minecraft=minecraft)
 
 @app.route("/movies")
 @login_required
@@ -525,7 +658,7 @@ def toggle_list(key):
             flash("Removed from My List.", "success")
         else:
             con.execute("INSERT OR IGNORE INTO my_list(user_id,movie_key,added_at) VALUES(1,?,?)",
-                        (key, datetime.utcnow().isoformat(timespec="seconds")))
+                        (key, datetime.now(timezone.utc).isoformat(timespec="seconds")))
             flash("Added to My List.", "success")
     return redirect(request.referrer if request.referrer and request.referrer.startswith("/") else url_for("movies_page"))
 
@@ -587,17 +720,20 @@ def video_file(key):
     if not match or "," in range_header:
         return Response(status=416, headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
     first, last = match.groups()
-    if first == "" and last == "":
+    if (first == "" and last == "") or len(first) > 20 or len(last) > 20:
         return Response(status=416, headers={"Content-Range": f"bytes */{size}"})
-    if first == "":
-        suffix = int(last)
-        if suffix <= 0:
-            return Response(status=416, headers={"Content-Range": f"bytes */{size}"})
-        start = max(0, size - suffix)
-        end = size - 1
-    else:
-        start = int(first)
-        end = int(last) if last else size - 1
+    try:
+        if first == "":
+            suffix = int(last)
+            if suffix <= 0:
+                return Response(status=416, headers={"Content-Range": f"bytes */{size}"})
+            start = max(0, size - suffix)
+            end = size - 1
+        else:
+            start = int(first)
+            end = int(last) if last else size - 1
+    except ValueError:
+        return Response(status=416, headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
     if start >= size or start < 0 or end < start:
         return Response(status=416, headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
     end = min(end, size - 1)
@@ -629,7 +765,9 @@ def save_progress(key):
     supplied = request.headers.get("X-CSRF-Token", "")
     if not token or not supplied or not hmac.compare_digest(token, supplied):
         return jsonify(error="CSRF validation failed"), 400
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="Progress must be a JSON object"), 400
     try:
         seconds = float(data.get("seconds", 0))
         duration = float(data.get("duration", 0))
@@ -643,7 +781,7 @@ def save_progress(key):
         con.execute("""INSERT INTO progress(user_id,movie_key,seconds,duration,updated_at)
             VALUES(1,?,?,?,?) ON CONFLICT(user_id,movie_key) DO UPDATE SET
             seconds=excluded.seconds,duration=excluded.duration,updated_at=excluded.updated_at""",
-            (key, seconds, duration, datetime.utcnow().isoformat(timespec="seconds")))
+            (key, seconds, duration, datetime.now(timezone.utc).isoformat(timespec="seconds")))
     return jsonify(ok=True)
 
 @app.route("/settings", methods=["GET", "POST"])
@@ -657,40 +795,191 @@ def settings_page():
             flash("Movie directory must be an absolute path.", "error")
         else:
             MOVIE_DIR = candidate
-            flash("Movie directory changed for this running process. Set XSERVER_MOVIE_DIR in your shell to persist it across restarts.", "success")
+            if MOVIE_DIR_FROM_ENV is None:
+                with db() as con:
+                    con.execute(
+                        "INSERT INTO settings(key,value) VALUES('movie_dir',?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (str(candidate),),
+                    )
+            flash("Movie directory updated. The setting is saved in SQLite unless XSERVER_MOVIE_DIR overrides it.", "success")
         return redirect(url_for("settings_page"))
     movies, err = scan_movies()
+    health = application_health(len(movies))
     body = r"""
     <div class="eyebrow">Configuration</div><h1>Settings</h1>
     <div class="card"><h2>Media directory</h2><p class="muted">Current folder: {{movie_dir}}</p><form method="post"><input type="hidden" name="_csrf" value="{{csrf()}}"><label for="movie_dir">Absolute movie folder path</label><input id="movie_dir" name="movie_dir" value="{{movie_dir}}" required><div class="form-actions"><button type="submit">Update folder</button></div></form>
     <p class="muted small">Default Android path: /storage/emulated/0/Movies. In Termux, run <code>termux-setup-storage</code> and grant the permission. For a permanent custom path, set the environment variable XSERVER_MOVIE_DIR before launching.</p></div>
-    <section class="section card"><h2>System status</h2><p>Database: <strong>Connected</strong></p><p>Movie folder: <strong>{{'Accessible' if not err else 'Unavailable'}}</strong></p><p>Detected movies: <strong>{{movies|length}}</strong></p><p>TMDB artwork lookup: <strong>{{'Enabled' if tmdb_enabled else 'Disabled (optional)'}}</strong></p><p class="muted small">Session lifetime: {{session_hours}} hours. Default bind: {{host}}:{{port}}.</p></section>
+    <section class="section card"><h2>System status</h2><p>Database integrity: <strong>{{'OK' if health.database_ok else 'Check failed'}}</strong></p><p>Movie folder: <strong>{{'Accessible' if not err else 'Unavailable'}}</strong></p><p>Detected movies: <strong>{{movies|length}}</strong></p><p>TMDB artwork lookup: <strong>{{'Enabled' if tmdb_enabled else 'Disabled (optional)'}}</strong></p><p class="muted small">Session lifetime: {{session_hours}} hours. Default bind: {{host}}:{{port}}.</p></section>
     """
-    return page("Settings", body, movie_dir=str(MOVIE_DIR), movies=movies, err=err,
+    return page("Settings", body, movie_dir=str(MOVIE_DIR), movies=movies, err=err, health=health,
                 tmdb_enabled=bool(TMDB_API_KEY), session_hours=SESSION_HOURS, host=HOST, port=PORT)
 
-def minecraft_status():
-    java = None
+@app.route("/diagnostics")
+@login_required
+def diagnostics_page():
+    movies, movie_error = scan_movies()
+    health = application_health(len(movies))
+    status = minecraft_status()
+    body = r"""
+    <div class="eyebrow">Read-only system information</div><h1>Diagnostics</h1>
+    <p class="muted">This screen reports application state only. It does not provide a shell or execute client-supplied commands.</p>
+    <div class="card"><h2>Application</h2><p>Database integrity: <strong>{{'OK' if health.database_ok else 'Check failed'}}</strong></p><p>Database path: <code>{{health.database_path}}</code></p><p>X Stream: <strong>{{health.movie_count}} movies</strong> · {{'directory readable' if health.movie_directory_accessible else 'directory unavailable'}}</p>{% if movie_error %}<p class="notice error">{{movie_error}}</p>{% endif %}</div>
+    <section class="section card"><h2>Minecraft manager</h2><p>Managed process: <strong>{{'Running' if minecraft.running else 'Stopped'}}</strong></p><p>Java: <strong>{{minecraft.java}}</strong> · configured JAR: <strong>{{'Yes' if minecraft.jar_exists else 'No'}}</strong></p><p class="muted small">Game-server start is always explicit. Opening diagnostics never starts it.</p></section>
+    <section class="section card"><h2>Configuration</h2><p>Bind address: <code>{{host}}:{{port}}</code></p><p>Movie directory: <code>{{movie_dir}}</code></p><p>Optional online metadata: <strong>{{'enabled' if tmdb_enabled else 'disabled'}}</strong></p><p>Terminal command execution: <strong>Not implemented</strong></p></section>
+    """
+    return page("Diagnostics", body, health=health, minecraft=status, movie_error=movie_error,
+                host=HOST, port=PORT, movie_dir=str(MOVIE_DIR), tmdb_enabled=bool(TMDB_API_KEY))
+
+def configured_minecraft_jar():
+    if not MC_JAR_FROM_ENV:
+        return None
     try:
-        p = subprocess.run(["java", "-version"], capture_output=True, text=True, timeout=3)
-        java = "available" if p.returncode == 0 else "unavailable"
+        root = MC_DIR.resolve()
+        configured = Path(MC_JAR_FROM_ENV).expanduser()
+        candidate = (configured if configured.is_absolute() else root / configured).resolve()
+        if candidate.parent != root or candidate.suffix.lower() != ".jar" or not candidate.is_file():
+            return None
+        return candidate
+    except OSError:
+        return None
+
+def minecraft_process_record():
+    pid_file = DATA_DIR / "minecraft.pid"
+    try:
+        record = json.loads(pid_file.read_text(encoding="utf-8"))
+        pid = int(record["pid"])
+        jar = Path(record["jar"]).resolve()
+        start_ticks = str(record["start_ticks"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    if pid <= 1:
+        return None
+    if configured_minecraft_jar() != jar:
+        return None
+    try:
+        proc_dir = Path("/proc") / str(pid)
+        command = (proc_dir / "cmdline").read_bytes().split(b"\0")
+        if os.fsencode(str(jar)) not in command:
+            return None
+        stat_fields = (proc_dir / "stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        if len(stat_fields) <= 19 or stat_fields[19] != start_ticks:
+            return None
+        os.kill(pid, 0)
+    except (OSError, IndexError, UnicodeError, ProcessLookupError):
+        return None
+    return {"pid": pid, "jar": str(jar), "start_ticks": start_ticks}
+
+def minecraft_status():
+    try:
+        proc = subprocess.run(["java", "-version"], capture_output=True, text=True, timeout=3)
+        java = "available" if proc.returncode == 0 else "unavailable"
     except (OSError, subprocess.TimeoutExpired):
         java = "unavailable"
-    pid_file = DATA_DIR / "minecraft.pid"
-    running = False
-    pid = None
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)
-            running = True
-        except (ValueError, OSError, ProcessLookupError):
-            running, pid = False, None
-            try: pid_file.unlink()
-            except OSError: pass
-    jar_exists = MC_DIR.is_dir() and any(MC_DIR.glob("*.jar"))
-    return {"directory": str(MC_DIR), "directory_exists": MC_DIR.is_dir(),
-            "jar_exists": jar_exists, "java": java, "running": running, "pid": pid}
+    jar = configured_minecraft_jar()
+    try:
+        memory_mb = int(MC_MAX_MEMORY_MB_SETTING)
+    except ValueError:
+        memory_mb = 0
+    record = minecraft_process_record()
+    return {
+        "directory": str(MC_DIR),
+        "directory_exists": MC_DIR.is_dir(),
+        "jar_exists": jar is not None,
+        "jar": str(jar) if jar else None,
+        "java": java,
+        "running": record is not None,
+        "pid": record["pid"] if record else None,
+        "memory_mb": memory_mb,
+        "memory_valid": 128 <= memory_mb <= 512,
+    }
+
+def minecraft_jar_in_use(jar: Path) -> bool:
+    expected = os.fsencode(str(jar.resolve()))
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return True
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                arguments = (Path("/proc") / entry.name / "cmdline").read_bytes().split(b"\0")
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except OSError:
+                continue
+            if expected in arguments:
+                return True
+    return False
+
+def start_minecraft():
+    status = minecraft_status()
+    if status["running"]:
+        flash("Minecraft manager already reports a verified process running.", "success")
+        return
+    if status["java"] != "available":
+        flash("Java was not found. Install a compatible Java runtime first.", "error")
+        return
+    if not status["directory_exists"] or not status["jar_exists"]:
+        flash(f"No explicitly configured server JAR was found inside {MC_DIR}. Set XSERVER_MC_JAR to the trusted JAR path.", "error")
+        return
+    if not status["memory_valid"]:
+        flash("XSERVER_MC_MAX_MEMORY_MB must be between 128 and 512.", "error")
+        return
+    jar = Path(status["jar"])
+    if minecraft_jar_in_use(jar):
+        flash("A process already uses the configured JAR, or process status cannot be inspected; refusing a duplicate start.", "error")
+        return
+    eula = MC_DIR / "eula.txt"
+    try:
+        eula_accepted = eula.is_file() and "eula=true" in eula.read_text(errors="ignore").lower()
+    except OSError:
+        eula_accepted = False
+    if not eula_accepted:
+        flash("Minecraft EULA not accepted. Review the official EULA and set eula=true yourself before starting.", "error")
+        return
+    try:
+        log_path = LOG_DIR / "minecraft.log"
+        with open(log_path, "ab", buffering=0) as log_file:
+            process = subprocess.Popen(
+                ["java", "-Xms128M", f"-Xmx{status['memory_mb']}M", "-jar", str(jar), "nogui"],
+                cwd=str(MC_DIR), stdin=subprocess.PIPE, stdout=log_file, stderr=subprocess.STDOUT,
+                start_new_session=True, close_fds=True,
+            )
+        time.sleep(1)
+        if process.poll() is not None:
+            flash("Minecraft process exited during startup. Check logs.", "error")
+            return
+        stat_fields = (Path("/proc") / str(process.pid) / "stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        record = {"pid": process.pid, "jar": str(jar), "start_ticks": stat_fields[19]}
+        pid_file = DATA_DIR / "minecraft.pid"
+        temp_pid_file = DATA_DIR / "minecraft.pid.tmp"
+        temp_pid_file.write_text(json.dumps(record), encoding="utf-8")
+        temp_pid_file.chmod(0o600)
+        temp_pid_file.replace(pid_file)
+    except (OSError, IndexError, subprocess.SubprocessError) as exc:
+        if "process" in locals() and process.poll() is None:
+            process.terminate()
+        app.logger.warning("Minecraft launch failed: %s", type(exc).__name__)
+        flash("Could not safely start Minecraft. Check Java, the configured server file, permissions, and logs.", "error")
+        return
+    flash(f"Managed Minecraft process started (PID {process.pid}). Check logs for readiness.", "success")
+
+def stop_minecraft():
+    record = minecraft_process_record()
+    if not record:
+        return False
+    try:
+        os.kill(record["pid"], signal.SIGTERM)
+    except OSError:
+        return False
+    for _ in range(20):
+        if minecraft_process_record() is None:
+            return True
+        time.sleep(0.25)
+    return False
 
 @app.route("/minecraft", methods=["GET", "POST"])
 @login_required
@@ -698,48 +987,21 @@ def minecraft_page():
     if request.method == "POST":
         verify_csrf()
         action = request.form.get("action", "")
-        status = minecraft_status()
         if action == "start":
-            if status["running"]:
-                flash("Minecraft manager already reports a process running.", "success")
-            elif status["java"] != "available":
-                flash("Java was not found. Install a compatible Java runtime first.", "error")
-            elif not status["directory_exists"] or not status["jar_exists"]:
-                flash(f"No server JAR found in {MC_DIR}. Place a trusted server JAR there and configure it before starting.", "error")
-            else:
-                # Only launch an explicitly configured JAR; no downloads, shell interpolation, or automatic install.
-                jar = sorted(MC_DIR.glob("*.jar"))[0]
-                eula = MC_DIR / "eula.txt"
-                if not eula.exists() or "eula=true" not in eula.read_text(errors="ignore").lower():
-                    flash("Minecraft EULA not accepted. Review the official EULA and set eula=true yourself before starting.", "error")
-                else:
-                    try:
-                        log_path = LOG_DIR / "minecraft.log"
-                        logf = open(log_path, "ab", buffering=0)
-                        proc = subprocess.Popen(["java", "-Xms256M", "-Xmx768M", "-jar", str(jar), "nogui"],
-                            cwd=str(MC_DIR), stdin=subprocess.PIPE, stdout=logf, stderr=subprocess.STDOUT,
-                            start_new_session=True, close_fds=True)
-                        time.sleep(1)
-                        if proc.poll() is not None:
-                            flash("Minecraft process exited during startup. Check logs.", "error")
-                        else:
-                            (DATA_DIR / "minecraft.pid").write_text(str(proc.pid))
-                            try: (DATA_DIR / "minecraft.pid").chmod(0o600)
-                            except OSError: pass
-                            flash(f"Managed Minecraft process started (PID {proc.pid}). Check logs for readiness.", "success")
-                    except (OSError, subprocess.SubprocessError) as exc:
-                        flash(f"Could not start Minecraft: {exc}", "error")
+            with MC_START_LOCK:
+                start_minecraft()
         elif action == "stop":
-            pid_file = DATA_DIR / "minecraft.pid"
-            try:
-                pid = int(pid_file.read_text().strip())
-                # Refuse to signal a process unless it is the exact PID recorded by this manager.
-                os.kill(pid, signal.SIGTERM)
-                flash("Stop signal sent to the managed process. Confirm shutdown in logs.", "success")
-            except (OSError, ValueError, ProcessLookupError):
-                flash("No live managed Minecraft process was found.", "error")
-            try: pid_file.unlink()
-            except OSError: pass
+            with MC_START_LOCK:
+                if stop_minecraft():
+                    flash("Verified managed Minecraft process stopped.", "success")
+                else:
+                    flash("No verifiable live Minecraft process stopped; it may still be shutting down.", "error")
+        elif action == "restart":
+            with MC_START_LOCK:
+                if stop_minecraft():
+                    start_minecraft()
+                else:
+                    flash("Minecraft was not restarted because its managed process could not be safely stopped.", "error")
         elif action == "refresh":
             flash("Status refreshed.", "success")
         return redirect(url_for("minecraft_page"))
@@ -754,10 +1016,10 @@ def minecraft_page():
     <p class="muted">This service is optional. X Stream keeps working if Minecraft is missing or stopped.</p>
     <div class="card"><div class="stats"><div class="stat"><strong>{{'Running' if status.running else 'Stopped'}}</strong><span class="muted">Managed process{% if status.pid %} · PID {{status.pid}}{% endif %}</span></div><div class="stat"><strong>{{status.java|title}}</strong><span class="muted">Java runtime</span></div><div class="stat"><strong>{{'Found' if status.jar_exists else 'Not found'}}</strong><span class="muted">Server JAR</span></div></div>
     <p class="muted small">Directory: {{status.directory}}</p>
-    <div class="actions"><form method="post"><input type="hidden" name="_csrf" value="{{csrf()}}"><button name="action" value="start" type="submit" {{'disabled' if status.running}}>Start server</button></form><form method="post" data-confirm="Send a stop signal to the process tracked by X Server?"><input type="hidden" name="_csrf" value="{{csrf()}}"><button class="danger" name="action" value="stop" type="submit" {{'disabled' if not status.running}}>Stop managed process</button></form><form method="post"><input type="hidden" name="_csrf" value="{{csrf()}}"><button class="secondary" name="action" value="refresh">Refresh status</button></form></div>
+    <div class="actions"><form method="post"><input type="hidden" name="_csrf" value="{{csrf()}}"><button name="action" value="start" type="submit" {{'disabled' if status.running}}>Start server</button></form><form method="post" data-confirm="Send a stop signal to the process tracked by X Server?"><input type="hidden" name="_csrf" value="{{csrf()}}"><button class="danger" name="action" value="stop" type="submit" {{'disabled' if not status.running}}>Stop managed process</button></form><form method="post" data-confirm="Stop and relaunch the configured server?"><input type="hidden" name="_csrf" value="{{csrf()}}"><button class="secondary" name="action" value="restart" type="submit" {{'disabled' if not status.running}}>Restart server</button></form><form method="post"><input type="hidden" name="_csrf" value="{{csrf()}}"><button class="secondary" name="action" value="refresh">Refresh status</button></form></div>
     </div>
     <section class="section card"><h2>Recent logs</h2><pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:420px;overflow:auto;color:#c8ccd6;font-size:.8rem">{{logs}}</pre></section>
-    <div class="notice">Safety: this manager does not download server software, accept the EULA, open public ports, or kill unrelated Java processes. Review the official Minecraft EULA before accepting it. Memory is limited on low-RAM phones; 768 MB is only a conservative starting setting and may still be too much.</div>
+    <div class="notice">Safety: starts require an explicitly configured JAR and accepted EULA. The configured heap defaults to 512 MiB maximum, excluding JVM/native and Android overhead. A Minecraft server is not recommended on a 2 GB phone; this manager does not auto-start it.</div>
     """
     return page("Minecraft Manager", body, status=status, logs=logs)
 
