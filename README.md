@@ -1,4 +1,4 @@
-# RTAD X Server
+# RTAD IDENTITY X Server
 
 X Server is a private, lightweight Flask and SQLite personal control center. X Stream indexes local video files; it does not download films or require online metadata. The application defaults to localhost and does not start optional services automatically.
 
